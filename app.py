@@ -1,5 +1,6 @@
 
-# app.py — ROI PX Day (2 uploads, sem gráficos, com normalização e filtro de clientes)
+# app.py — ROI PX Day (2 uploads, sem gráficos)
+# Resumo: UMA LINHA POR CNPJ (sem somar dias entre CNPJs)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -47,7 +48,6 @@ def read_any_csv(uploaded_file) -> pd.DataFrame:
             try:
                 uploaded_file.seek(0)
                 df = pd.read_csv(uploaded_file, sep=sep, encoding=enc, engine="python")
-                # ignora leituras claramente inválidas
                 if df.empty or all(str(c).startswith("Unnamed") for c in df.columns):
                     continue
                 return df
@@ -66,7 +66,6 @@ def parse_mes_col(df: pd.DataFrame, col: str = "MES") -> pd.DataFrame:
     Aceita dd/mm/aaaa, yyyy-mm-dd, ISO com timezone, etc.
     """
     out = df.copy()
-    # tentativas dirigidas
     tried = False
     for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d/%m/%y"):
         try:
@@ -97,7 +96,7 @@ def trimestre_str(m: int) -> str:
 
 def media_trimestral_visita(agr_mes: pd.DataFrame, visit_month_str: str) -> tuple[float, str]:
     """
-    Média dos DIAS DE CONTRATO no trimestre civil da visita.
+    Média dos DIAS DE CONTRATO no trimestre civil da visita (para aquele CNPJ).
     Retorna (media, "Qx-YYYY").
     """
     if not visit_month_str:
@@ -224,12 +223,21 @@ if st.button("🚀 Gerar relatório", type="primary", use_container_width=True):
         if dias_col != "DIAS DE CONTRATO":
             df = df.rename(columns={dias_col: "DIAS DE CONTRATO"})
 
-        # limpa e deriva colunas
+        # normalizações básicas
         df = parse_mes_col(df, col="MES")
         df["DIAS DE CONTRATO"] = clean_num_series(df["DIAS DE CONTRATO"])
-
-        # normaliza nome do cliente na base mensal
         df["Cliente_norm"] = df["NOME TRANSPORTADORA(S)"].astype(str).map(normalize_name)
+
+        # CNPJ (detecta ou cria placeholder)
+        cnpj_col = None
+        for c in df.columns:
+            if "cnpj" in c.lower():
+                cnpj_col = c; break
+        if cnpj_col and cnpj_col != "CNPJ":
+            df = df.rename(columns={cnpj_col: "CNPJ"})
+        elif not cnpj_col:
+            df["CNPJ"] = "__SEM_CNPJ__"  # quando a base não traz CNPJ
+
     except Exception as e:
         st.error(f"Erro ao padronizar a base mensal: {e}")
         st.stop()
@@ -257,9 +265,8 @@ if st.button("🚀 Gerar relatório", type="primary", use_container_width=True):
     clientes_base = set(df["Cliente_norm"].unique())
     visitas = visitas[visitas["Cliente_norm"].isin(clientes_base)].copy()
 
-    # ---------- Processar por cliente ----------
+    # ---------- Processar por cliente (UMA LINHA POR CNPJ) ----------
     linhas = []
-    # agrupar mensal por cliente é feito dentro do loop para manter status/último do mês
     for _, rowv in visitas.iterrows():
         cliente_raw = rowv["Cliente"]
         cliente_norm = rowv["Cliente_norm"]
@@ -267,107 +274,86 @@ if st.button("🚀 Gerar relatório", type="primary", use_container_width=True):
 
         dcli = df[df["Cliente_norm"] == cliente_norm].copy()
         if dcli.empty:
-            # sem match? ignora (não entra no relatório)
             continue
 
-        # Agrega por AnoMes
-        agg_dict = {"DIAS DE CONTRATO": ("DIAS DE CONTRATO", "sum")}
-        if "ESTADO" in dcli.columns:
-            agg_dict["ESTADO"] = ("ESTADO", "last")
+        # Todos os CNPJs desse cliente (nome)
+        cnpjs_cliente = (
+            dcli["CNPJ"]
+            .dropna()
+            .astype(str)
+            .unique()
+            .tolist()
+        )
+        # Se não há CNPJ na base, geramos uma única linha com "__SEM_CNPJ__"
+        if not cnpjs_cliente:
+            cnpjs_cliente = ["__SEM_CNPJ__"]
 
-        agr = dcli.groupby(["AnoMes"], as_index=False).agg(**agg_dict)
+        for cnpj in sorted(cnpjs_cliente):
+            dcnpj = dcli[dcli["CNPJ"] == cnpj].copy()
+            if dcnpj.empty:
+                # (pode ocorrer se houver linhas sem CNPJ em algum mês)
+                continue
 
-        # Prepara campos auxiliares para baseline
-        agr["Ano"] = pd.to_datetime(agr["AnoMes"]).dt.year
-        agr["MesNum"] = pd.to_datetime(agr["AnoMes"]).dt.month
+            # AGREGA por CNPJ+AnoMes: soma dias dentro do MES para aquele CNPJ (filiais/duplicatas)
+            # OBS.: não soma entre CNPJs diferentes — cada CNPJ sai em linha própria.
+            agr = (
+                dcnpj.groupby("AnoMes", as_index=False)
+                     .agg({
+                         "DIAS DE CONTRATO": "sum",   # só dentro do próprio CNPJ
+                         "ESTADO": "last"            # status do CNPJ no mês
+                     })
+            )
 
-        # Baseline (trimestre da visita)
-        baseline, rot_trim = media_trimestral_visita(agr_mes=agr, visit_month_str=visit_month)
+            # Auxiliares / baseline por CNPJ
+            agr["Ano"] = pd.to_datetime(agr["AnoMes"]).dt.year
+            agr["MesNum"] = pd.to_datetime(agr["AnoMes"]).dt.month
+            baseline, rot_trim = media_trimestral_visita(agr_mes=agr, visit_month_str=visit_month)
 
-        # Status no mês da visita (se existir)
-        status_visit = agr.loc[agr["AnoMes"] == visit_month, "ESTADO"].iloc[0] \
-            if ("ESTADO" in agr.columns and visit_month in set(agr["AnoMes"])) else None
+            # Status (visita) e (atual) do CNPJ
+            status_visit = agr.loc[agr["AnoMes"] == visit_month, "ESTADO"].iloc[0] \
+                if (visit_month in set(agr["AnoMes"])) else None
+            current_val = float(agr.loc[agr["AnoMes"] == current_month_str, "DIAS DE CONTRATO"].iloc[0]) \
+                if current_month_str in set(agr["AnoMes"]) else np.nan
+            status_current = agr.loc[agr["AnoMes"] == current_month_str, "ESTADO"].iloc[0] \
+                if (current_month_str in set(agr["AnoMes"])) else None
 
-        # Atual (último mês)
-        current_val = float(agr.loc[agr["AnoMes"] == current_month_str, "DIAS DE CONTRATO"].iloc[0]) \
-            if current_month_str in set(agr["AnoMes"]) else np.nan
-        status_current = agr.loc[agr["AnoMes"] == current_month_str, "ESTADO"].iloc[0] \
-            if ("ESTADO" in agr.columns and current_month_str in set(agr["AnoMes"])) else None
+            # Impacto por CNPJ
+            impacto_dias, impacto_pct = np.nan, np.nan
+            if visit_month and (not np.isnan(baseline)) and (not np.isnan(current_val)):
+                impacto_dias = current_val - baseline
+                if baseline > 0:
+                    impacto_pct = impacto_dias / baseline * 100.0
 
-        # Impacto
-        impacto_dias, impacto_pct = np.nan, np.nan
-        if visit_month and (not np.isnan(baseline)) and (not np.isnan(current_val)):
-            impacto_dias = current_val - baseline
-            if baseline > 0:
-                impacto_pct = impacto_dias / baseline * 100.0
+            # Série últimos N meses (por CNPJ)
+            serieN = {
+                m: float(agr.loc[agr["AnoMes"] == m, "DIAS DE CONTRATO"].iloc[0]) if m in set(agr["AnoMes"]) else 0.0
+                for m in mesesN
+            }
+            mediaN = float(np.mean(list(serieN.values()))) if len(serieN) > 0 else np.nan
 
-        # Série últimos N meses
-        serieN = {
-            m: float(agr.loc[agr["AnoMes"] == m, "DIAS DE CONTRATO"].iloc[0]) if m in set(agr["AnoMes"]) else 0.0
-            for m in mesesN
-        }
-        mediaN = float(np.mean(list(serieN.values()))) if len(serieN) > 0 else np.nan
+            obs = ""
+            if visit_month == current_month_str:
+                obs = "Sem mês completo pós-visita (visita no mês do 'Atual')"
 
-        obs = ""
-        if visit_month == current_month_str:
-            obs = "Sem mês completo pós-visita (visita no mês do 'Atual')"
-
-        linha = {
-            "Cliente": cliente_raw,
-            "Visit Month": visit_month,
-            "Visita: Trimestre": rot_trim,
-            "Baseline (visit quarter avg)": baseline,
-            f"Atual ({current_month_str})": current_val,
-            "Impacto (dias)": impacto_dias,
-            "Impacto (%)": impacto_pct,
-            "Status (visita)": status_visit,
-            f"Status ({current_month_str})": status_current,
-            f"Média {meses_janela}m": mediaN,
-            "Observação": obs,
-        }
-        linha.update(serieN)
-        linhas.append(linha)
+            linha = {
+                "Cliente": cliente_raw,
+                "Cliente_norm": cliente_norm,
+                "CNPJ": cnpj,
+                "Visit Month": visit_month,
+                "Visita: Trimestre": rot_trim,
+                "Baseline (visit quarter avg)": baseline,
+                f"Atual ({current_month_str})": current_val,
+                "Impacto (dias)": impacto_dias,
+                "Impacto (%)": impacto_pct,
+                "Status (visita)": status_visit,
+                f"Status ({current_month_str})": status_current,
+                f"Média {meses_janela}m": mediaN,
+                "Observação": obs,
+            }
+            linha.update(serieN)
+            linhas.append(linha)
 
     # ---------- Monta saídas ----------
     if len(linhas) == 0:
-        st.warning("Nenhum cliente com visita encontrou correspondência na base mensal após normalização.")
+        st.warning("Nenhum CNPJ com visita encontrou correspondência na base mensal após normalização.")
         st.stop()
-
-    resumo = pd.DataFrame(linhas)
-
-    # Pivot mensal (para os últimos N meses)
-    dfN = df[df["AnoMes"].isin(mesesN)].copy()
-    pivot = dfN.pivot_table(
-        index="NOME TRANSPORTADORA(S)",
-        columns="AnoMes",
-        values="DIAS DE CONTRATO",
-        aggfunc="sum"
-    ).fillna(0.0).reset_index()
-
-    st.success(f"Relatório gerado. {len(resumo):,} clientes com match.", icon="✅")
-    st.dataframe(resumo, use_container_width=True)
-
-    # ===== Downloads =====
-    # CSV (Excel-friendly)
-    csv_bytes = resumo.to_csv(index=False, sep=";", encoding="utf-8-sig").encode("utf-8-sig")
-    st.download_button(
-        "💾 Baixar CSV (Resumo)",
-        data=csv_bytes,
-        file_name="ROI_PX_Day_Resumo.csv",
-        mime="text/csv",
-        use_container_width=True
-    )
-
-    # Excel com duas abas
-    xbuf = BytesIO()
-    with pd.ExcelWriter(xbuf, engine="openpyxl") as wr:
-        resumo.to_excel(wr, sheet_name=f"Resumo ({meses_janela}m)", index=False)
-        pivot.to_excel(wr, sheet_name=f"Mensal por Cliente ({meses_janela}m)", index=False)
-    xbuf.seek(0)
-    st.download_button(
-        "📘 Baixar Excel (2 abas)",
-        data=xbuf.getvalue(),
-        file_name="ROI_PX_Day_relatorio.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True
-    )
