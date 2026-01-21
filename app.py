@@ -1,6 +1,6 @@
 
 # app.py — ROI PX Day (2 uploads, sem gráficos)
-# Resumo: UMA LINHA POR CNPJ (sem somar dias entre CNPJs)
+# Visão: UMA LINHA POR CNPJ (sem somar dias entre CNPJs) + Expander de Diagnóstico
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -28,9 +28,10 @@ def normalize_name(s: str) -> str:
     s = strip_accents(s).upper().strip()
     for suf in SUFIXOS_EXCLUIR:
         s = re.sub(rf"\b{suf}\b", " ", s, flags=re.IGNORECASE)
-    s = re.sub(r"[^A-Z0-9/&.\- ]", " ", s)  # remove símbolos estranhos
+    # remove símbolos estranhos (mantém / & . - e espaço)
+    s = re.sub(r"[^A-Z0-9/&.\- ]", " ", s)
     s = re.sub(r"\s{2,}", " ", s).strip()
-    # padroniza formas frequentes
+    # padroniza variações
     s = re.sub(r"\bS A\b", "SA", s)
     s = re.sub(r"\bS\/A\b", "SA", s)
     return s
@@ -48,6 +49,7 @@ def read_any_csv(uploaded_file) -> pd.DataFrame:
             try:
                 uploaded_file.seek(0)
                 df = pd.read_csv(uploaded_file, sep=sep, encoding=enc, engine="python")
+                # ignora leituras claramente inválidas
                 if df.empty or all(str(c).startswith("Unnamed") for c in df.columns):
                     continue
                 return df
@@ -56,9 +58,9 @@ def read_any_csv(uploaded_file) -> pd.DataFrame:
     raise RuntimeError(f"Falha ao ler CSV. Último erro: {last_err}")
 
 def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-    return df
+    out = df.copy()
+    out.columns = [str(c).strip() for c in out.columns]
+    return out
 
 def parse_mes_col(df: pd.DataFrame, col: str = "MES") -> pd.DataFrame:
     """
@@ -76,7 +78,11 @@ def parse_mes_col(df: pd.DataFrame, col: str = "MES") -> pd.DataFrame:
             pass
     if not tried:
         out[col] = pd.to_datetime(out[col], errors="coerce")  # ISO, tz, etc.
-    out[col] = out[col].dt.tz_localize(None)
+    # remove timezone se existir (mas não quebra se já for naive)
+    try:
+        out[col] = out[col].dt.tz_localize(None)
+    except (TypeError, AttributeError):
+        pass
     out["AnoMes"] = out[col].dt.strftime("%Y-%m")
     out["Ano"] = out[col].dt.year
     out["MesNum"] = out[col].dt.month
@@ -136,6 +142,7 @@ def detectar_colunas_visitas(dfv: pd.DataFrame) -> tuple[str, str]:
 def preparar_visitas(dfv: pd.DataFrame) -> pd.DataFrame:
     """
     Padroniza a base de visitas, gera Cliente_norm (normalizado) e VisitMonth (YYYY-MM).
+    Dedup: mantem última por Cliente_norm (caso enviado mais de uma visita).
     """
     dfv = normalize_cols(dfv)
     col_cli, col_dt = detectar_colunas_visitas(dfv)
@@ -145,7 +152,7 @@ def preparar_visitas(dfv: pd.DataFrame) -> pd.DataFrame:
     # normaliza cliente
     out["Cliente_norm"] = out["Cliente"].astype(str).map(normalize_name)
 
-    # normaliza data -> AnoMes
+    # normaliza DataVisita -> AnoMes (YYYY-MM)
     def to_ym(s):
         s = str(s).strip()
         for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%Y", "%Y-%m", "%d-%m-%Y"):
@@ -164,7 +171,7 @@ def preparar_visitas(dfv: pd.DataFrame) -> pd.DataFrame:
 # =====================================
 # UI — uploads e parâmetros do relatório
 # =====================================
-st.title("ROI PX Day — Relatório (sem gráficos)")
+st.title("ROI PX Day — Relatório (sem gráficos, 1 linha por CNPJ)")
 
 col1, col2 = st.columns(2)
 with col1:
@@ -223,20 +230,18 @@ if st.button("🚀 Gerar relatório", type="primary", use_container_width=True):
         if dias_col != "DIAS DE CONTRATO":
             df = df.rename(columns={dias_col: "DIAS DE CONTRATO"})
 
-        # normalizações básicas
+        # normalizações
         df = parse_mes_col(df, col="MES")
         df["DIAS DE CONTRATO"] = clean_num_series(df["DIAS DE CONTRATO"])
         df["Cliente_norm"] = df["NOME TRANSPORTADORA(S)"].astype(str).map(normalize_name)
 
-        # CNPJ (detecta ou cria placeholder)
-        cnpj_col = None
-        for c in df.columns:
-            if "cnpj" in c.lower():
-                cnpj_col = c; break
+        # --- CNPJ robusto (rename + fallback) ---
+        cnpj_col = next((c for c in df.columns if "cnpj" in c.lower()), None)
         if cnpj_col and cnpj_col != "CNPJ":
             df = df.rename(columns={cnpj_col: "CNPJ"})
-        elif not cnpj_col:
-            df["CNPJ"] = "__SEM_CNPJ__"  # quando a base não traz CNPJ
+        if not cnpj_col:
+            df["CNPJ"] = "__SEM_CNPJ__"   # quando a base não traz CNPJ
+        df["CNPJ"] = df["CNPJ"].astype(str).str.strip()
 
     except Exception as e:
         st.error(f"Erro ao padronizar a base mensal: {e}")
@@ -244,7 +249,7 @@ if st.button("🚀 Gerar relatório", type="primary", use_container_width=True):
 
     # ---------- Padronizar base de visitas ----------
     try:
-        visitas = preparar_visitas(dfv)  # Cliente, Cliente_norm, VisitMonth
+        visitas = preparar_visitas(dfv)  # colunas: Cliente, Cliente_norm, VisitMonth
     except Exception as e:
         st.error(f"Erro na base de visitas: {e}")
         st.stop()
@@ -261,9 +266,40 @@ if st.button("🚀 Gerar relatório", type="primary", use_container_width=True):
     mesesN = [p.strftime("%Y-%m") for p in pd.period_range(end=pd.Period(current_month_str, freq="M"),
                                                            periods=meses_janela)]
 
-    # ---------- Filtrar visitas para clientes existentes na base mensal ----------
-    clientes_base = set(df["Cliente_norm"].unique())
+    # ---------- Diagnóstico (antes do loop) ----------
+    # Match por nome normalizado entre visitas e base mensal
+    visitas_pre = visitas.copy()
+    clientes_base = set(df["Cliente_norm"].dropna().unique())
     visitas = visitas[visitas["Cliente_norm"].isin(clientes_base)].copy()
+
+    nao_casaram = sorted(list(set(visitas_pre["Cliente_norm"]) - clientes_base))
+    amostra_match = sorted(list(set(visitas["Cliente_norm"]).intersection(clientes_base)))[:10]
+
+    # Quantidade de CNPJs por cliente com match (amostra)
+    amostras_cnpjs = []
+    for cn in amostra_match:
+        dcli = df[df["Cliente_norm"] == cn]
+        cnpjs = sorted(dcli["CNPJ"].astype(str).unique().tolist())
+        amostras_cnpjs.append({"Cliente_norm": cn, "Qtde CNPJs": len(cnpjs), "Exemplo CNPJs": "; ".join(cnpjs[:5])})
+
+    with st.expander("🔍 Diagnóstico"):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric("Visitas (arquivo)", value=f"{len(visitas_pre):,}")
+        with c2:
+            st.metric("Visitas com match por nome", value=f"{len(visitas):,}")
+        with c3:
+            st.metric("Clientes base (normalizados)", value=f"{len(clientes_base):,}")
+
+        if nao_casaram:
+            st.warning(f"Sem correspondência por nome (normalizado): {', '.join(nao_casaram[:20])}"
+                       + (" ..." if len(nao_casaram) > 20 else ""))
+        else:
+            st.success("Todas as visitas encontraram correspondência por nome normalizado.")
+
+        if amostras_cnpjs:
+            st.markdown("**Amostra de clientes com match e seus CNPJs:**")
+            st.dataframe(pd.DataFrame(amostras_cnpjs), use_container_width=True)
 
     # ---------- Processar por cliente (UMA LINHA POR CNPJ) ----------
     linhas = []
@@ -274,6 +310,7 @@ if st.button("🚀 Gerar relatório", type="primary", use_container_width=True):
 
         dcli = df[df["Cliente_norm"] == cliente_norm].copy()
         if dcli.empty:
+            # sem match? ignora (não entra no relatório)
             continue
 
         # Todos os CNPJs desse cliente (nome)
@@ -284,27 +321,28 @@ if st.button("🚀 Gerar relatório", type="primary", use_container_width=True):
             .unique()
             .tolist()
         )
-        # Se não há CNPJ na base, geramos uma única linha com "__SEM_CNPJ__"
         if not cnpjs_cliente:
             cnpjs_cliente = ["__SEM_CNPJ__"]
 
         for cnpj in sorted(cnpjs_cliente):
             dcnpj = dcli[dcli["CNPJ"] == cnpj].copy()
             if dcnpj.empty:
-                # (pode ocorrer se houver linhas sem CNPJ em algum mês)
                 continue
 
             # AGREGA por CNPJ+AnoMes: soma dias dentro do MES para aquele CNPJ (filiais/duplicatas)
             # OBS.: não soma entre CNPJs diferentes — cada CNPJ sai em linha própria.
-            agr = (
-                dcnpj.groupby("AnoMes", as_index=False)
-                     .agg({
-                         "DIAS DE CONTRATO": "sum",   # só dentro do próprio CNPJ
-                         "ESTADO": "last"            # status do CNPJ no mês
-                     })
-            )
+            agg = dcnpj.groupby("AnoMes", as_index=False).agg({
+                "DIAS DE CONTRATO": "sum",     # apenas dentro do próprio CNPJ
+            })
+            # se existir coluna de status, mantém o "último" do mês (comportamento original por CNPJ)
+            if "ESTADO" in dcnpj.columns:
+                estado_mes = dcnpj.groupby("AnoMes", as_index=False)["ESTADO"].last()
+                agr = pd.merge(agg, estado_mes, on="AnoMes", how="left")
+            else:
+                agr = agg
+                agr["ESTADO"] = None
 
-            # Auxiliares / baseline por CNPJ
+            # Campos auxiliares e baseline por CNPJ
             agr["Ano"] = pd.to_datetime(agr["AnoMes"]).dt.year
             agr["MesNum"] = pd.to_datetime(agr["AnoMes"]).dt.month
             baseline, rot_trim = media_trimestral_visita(agr_mes=agr, visit_month_str=visit_month)
@@ -357,3 +395,46 @@ if st.button("🚀 Gerar relatório", type="primary", use_container_width=True):
     if len(linhas) == 0:
         st.warning("Nenhum CNPJ com visita encontrou correspondência na base mensal após normalização.")
         st.stop()
+
+    resumo = pd.DataFrame(linhas)
+
+    # Pivot mensal (últimos N meses) — por NOME + CNPJ (sem somar entre CNPJs)
+    dfN = df[df["AnoMes"].isin(mesesN)].copy()
+    pivot = (
+        dfN.pivot_table(
+            index=["NOME TRANSPORTADORA(S)", "CNPJ"],
+            columns="AnoMes",
+            values="DIAS DE CONTRATO",
+            aggfunc="sum"
+        )
+        .fillna(0.0)
+        .reset_index()
+    )
+
+    st.success(f"Relatório gerado. {len(resumo):,} linhas (1 por CNPJ).", icon="✅")
+    st.dataframe(resumo, use_container_width=True)
+
+    # ===== Downloads =====
+    # CSV (Excel-friendly)
+    csv_bytes = resumo.to_csv(index=False, sep=";", encoding="utf-8-sig").encode("utf-8-sig")
+    st.download_button(
+        "💾 Baixar CSV (Resumo por CNPJ)",
+        data=csv_bytes,
+        file_name="ROI_PX_Day_Resumo_por_CNPJ.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
+    # Excel com duas abas
+    xbuf = BytesIO()
+    with pd.ExcelWriter(xbuf, engine="openpyxl") as wr:
+        resumo.to_excel(wr, sheet_name=f"Resumo_CNPJ ({meses_janela}m)", index=False)
+        pivot.to_excel(wr, sheet_name=f"Mensal por CNPJ ({meses_janela}m)", index=False)
+    xbuf.seek(0)
+    st.download_button(
+        "📘 Baixar Excel (2 abas)",
+        data=xbuf.getvalue(),
+        file_name="ROI_PX_Day_relatorio_por_CNPJ.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True
+    )
