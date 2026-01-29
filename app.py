@@ -1,5 +1,6 @@
-# app.py — ROI PX Day (agora por Nome, somando CNPJs)
+# app.py — ROI PX Day (por Nome, somando CNPJs)
 # Visão: UMA LINHA POR NOME (somando CNPJs do cliente) + Expander de Diagnóstico
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -33,9 +34,12 @@ def normalize_name(s: str) -> str:
     Mantém números e alguns símbolos úteis (/ & . -).
     """
     s = strip_accents(s).upper().strip()
+    # Remove sufixos definidos em SUFIXOS_EXCLUIR
     s = SUFIXOS_RE.sub(" ", s)
+    # Mantém apenas caracteres válidos
     s = re.sub(r"[^A-Z0-9/&.\- ]", " ", s)
     s = re.sub(r"\s{2,}", " ", s).strip()
+    # Padronizações pontuais
     s = re.sub(r"\bS A\b", "SA", s)
     s = re.sub(r"\bS\/A\b", "SA", s)
     return s
@@ -44,6 +48,10 @@ def normalize_name(s: str) -> str:
 # Funções utilitárias de leitura
 # ==============================
 def find_column(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    """
+    Procura por uma coluna no DataFrame comparando versões sem acentos e lower.
+    Retorna o nome real da coluna se encontrado, senão None.
+    """
     cols_norm = {strip_accents(str(c)).lower(): c for c in df.columns}
     for cand in candidates:
         key = strip_accents(cand).lower()
@@ -53,6 +61,10 @@ def find_column(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
 
 @st.cache_data(show_spinner=False)
 def read_any_csv_bytes(data: bytes) -> pd.DataFrame:
+    """
+    Lê CSV a partir de bytes (cacheável por streamlit).
+    Tenta diferentes encodings e separadores.
+    """
     last_err = None
     bio = BytesIO(data)
     for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
@@ -60,6 +72,7 @@ def read_any_csv_bytes(data: bytes) -> pd.DataFrame:
             try:
                 bio.seek(0)
                 df = pd.read_csv(bio, sep=sep, encoding=enc, engine="python")
+                # ignora leituras claramente inválidas
                 if df.empty or all(str(c).startswith("Unnamed") for c in df.columns):
                     continue
                 return df
@@ -73,6 +86,10 @@ def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def parse_mes_col(df: pd.DataFrame, col: str = "MES") -> pd.DataFrame:
+    """
+    Converte coluna MES para datetime (ignora hora) e cria AnoMes/Ano/MesNum.
+    Aceita dd/mm/aaaa, yyyy-mm-dd, ISO com timezone, etc.
+    """
     out = df.copy()
     tried = False
     for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d/%m/%y"):
@@ -83,7 +100,8 @@ def parse_mes_col(df: pd.DataFrame, col: str = "MES") -> pd.DataFrame:
         except Exception:
             pass
     if not tried:
-        out[col] = pd.to_datetime(out[col], errors="coerce")
+        out[col] = pd.to_datetime(out[col], errors="coerce")  # ISO, tz, etc.
+    # remove timezone se existir (mas não quebra se já for naive)
     try:
         out[col] = out[col].dt.tz_localize(None)
     except (TypeError, AttributeError):
@@ -94,29 +112,43 @@ def parse_mes_col(df: pd.DataFrame, col: str = "MES") -> pd.DataFrame:
     return out
 
 def clean_num_series(s: pd.Series) -> pd.Series:
+    """
+    Limpa números no padrão PT-BR e variantes:
+    - remove espaços, símbolos de moeda
+    - converte parênteses em negativo
+    - remove separador de milhar (.) e troca vírgula decimal por ponto
+    """
     def clean_val(x):
         if pd.isna(x):
             return np.nan
         t = str(x).strip()
         if t == "":
             return np.nan
+        # detecta parênteses -> negativo
         neg = False
         if t.startswith("(") and t.endswith(")"):
             neg = True
             t = t[1:-1]
+        # remove tudo que não seja dígito, vírgula, ponto ou sinal
         t = re.sub(r"[^0-9,.\-]", "", t)
+        # trata milhar/decimal (padrão BR)
         t = t.replace(".", "").replace(",", ".")
         try:
             val = float(t) if t not in ("", ".", "-", ",") else np.nan
         except Exception:
             val = np.nan
         return -val if neg else val
+
     return s.apply(clean_val).astype(float)
 
 def trimestre_str(m: int) -> str:
     return "Q1" if m in (1,2,3) else ("Q2" if m in (4,5,6) else ("Q3" if m in (7,8,9) else "Q4"))
 
 def media_trimestral_visita(agr_mes: pd.DataFrame, visit_month_str: str) -> Tuple[float, str]:
+    """
+    Média dos DIAS DE CONTRATO no trimestre civil da visita (para aquele agregado de Nome).
+    Retorna (media, "Qx-YYYY").
+    """
     if not visit_month_str:
         return np.nan, ""
     try:
@@ -134,6 +166,10 @@ def media_trimestral_visita(agr_mes: pd.DataFrame, visit_month_str: str) -> Tupl
     return media, f"{trimestre_str(m)}-{ano}"
 
 def detectar_colunas_visitas(dfv: pd.DataFrame) -> Tuple[str, str]:
+    """
+    Detecta a coluna de cliente e coluna de data em uma base de visitas.
+    """
+    # tenta por candidatos usando find_column (que normaliza acentos)
     col_cli = find_column(dfv, ["cliente", "nome transportadora(s)", "nome", "transportadora", "transportadoras"])
     if not col_cli:
         col_cli = dfv.columns[0]
@@ -143,12 +179,19 @@ def detectar_colunas_visitas(dfv: pd.DataFrame) -> Tuple[str, str]:
     return col_cli, col_dt
 
 def preparar_visitas(dfv: pd.DataFrame) -> pd.DataFrame:
+    """
+    Padroniza a base de visitas, gera Cliente_norm (normalizado) e VisitMonth (YYYY-MM).
+    Dedup: mantém última por Cliente_norm (caso enviado mais de uma visita).
+    """
     dfv = normalize_cols(dfv)
     col_cli, col_dt = detectar_colunas_visitas(dfv)
     out = dfv[[col_cli, col_dt]].copy()
     out.columns = ["Cliente", "DataVisita"]
+
+    # normaliza cliente
     out["Cliente_norm"] = out["Cliente"].astype(str).map(normalize_name)
 
+    # normaliza DataVisita -> AnoMes (YYYY-MM)
     def to_ym(s):
         s = str(s).strip()
         for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%Y", "%Y-%m", "%d-%m-%Y"):
@@ -171,9 +214,9 @@ st.title("ROI PX Day — Relatório (por Nome, somando CNPJs)")
 
 col1, col2 = st.columns(2)
 with col1:
-    comportamento_file = st.file_uploader("📥 Base Mensal — comportamento (CSV)", type=["csv"])
+    comportamento_file = st.file_uploader("📥 Base Mensal — comportamento (CSV)", type=["csv"]) 
 with col2:
-    visitas_file = st.file_uploader("🎯 Base de Visitas PX Day — clientes e data (CSV)", type=["csv"])
+    visitas_file = st.file_uploader("🎯 Base de Visitas PX Day — clientes e data (CSV)", type=["csv"]) 
 
 with st.expander("⚙️ Parâmetros (opcional)"):
     meses_janela = st.number_input("Últimos N meses para a visão mensal", min_value=3, max_value=24, value=6, step=1)
@@ -183,7 +226,7 @@ if st.button("🚀 Gerar relatório", type="primary", use_container_width=True):
         st.warning("Envie os dois arquivos CSV para continuar.")
         st.stop()
 
-    # ---------- Ler bases ----------
+    # ---------- Ler bases (usando cache) ----------
     try:
         df = read_any_csv_bytes(comportamento_file.getvalue())
         dfv = read_any_csv_bytes(visitas_file.getvalue())
@@ -222,15 +265,15 @@ if st.button("🚀 Gerar relatório", type="primary", use_container_width=True):
         df["DIAS DE CONTRATO"] = clean_num_series(df["DIAS DE CONTRATO"])
         df["Cliente_norm"] = df["NOME TRANSPORTADORA(S)"].astype(str).map(normalize_name)
 
-        # CNPJ (opcional/robusto)
+        # --- CNPJ robusto (rename + fallback) ---
         cnpj_col = find_column(df, ["cnpj", "cnpj cliente", "cpf/cnpj", "cpf"])
         if cnpj_col and cnpj_col != "CNPJ":
             df = df.rename(columns={cnpj_col: "CNPJ"})
         if "CNPJ" not in df.columns:
-            df["CNPJ"] = "__SEM_CNPJ__"
+            df["CNPJ"] = "__SEM_CNPJ__"   # quando a base não traz CNPJ
         df["CNPJ"] = df["CNPJ"].astype(str).str.strip().replace("", "__SEM_CNPJ__")
 
-        # ESTADO (garante existência)
+        # garante coluna ESTADO (mesmo que vazia) para evitar KeyError
         if "ESTADO" not in df.columns:
             df["ESTADO"] = np.nan
 
@@ -240,12 +283,12 @@ if st.button("🚀 Gerar relatório", type="primary", use_container_width=True):
 
     # ---------- Padronizar base de visitas ----------
     try:
-        visitas = preparar_visitas(dfv)
+        visitas = preparar_visitas(dfv)  # colunas: Cliente, Cliente_norm, VisitMonth
     except Exception as e:
         st.error(f"Erro na base de visitas: {e}")
         st.stop()
 
-    # ---------- Último mês fechado ----------
+    # ---------- Determinar último mês fechado ----------
     if df["MES"].notna().any():
         try:
             ultimo_mes_fechado = df["MES"].max().to_period("M").to_timestamp("M")
@@ -261,7 +304,7 @@ if st.button("🚀 Gerar relatório", type="primary", use_container_width=True):
     mesesN = [p.strftime("%Y-%m") for p in pd.period_range(end=pd.Period(current_month_str, freq="M"),
                                                            periods=meses_janela)]
 
-    # ---------- Diagnóstico ----------
+    # ---------- Diagnóstico (antes do processamento) ----------
     visitas_pre = visitas.copy()
     clientes_base = set(df["Cliente_norm"].dropna().unique())
     visitas = visitas[visitas["Cliente_norm"].isin(clientes_base)].copy()
@@ -269,10 +312,11 @@ if st.button("🚀 Gerar relatório", type="primary", use_container_width=True):
     nao_casaram = sorted(list(set(visitas_pre["Cliente_norm"]) - clientes_base))
     amostra_match = sorted(list(set(visitas_pre["Cliente_norm"]).intersection(clientes_base)))[:10]
 
+    # Quantidade de CNPJs por cliente com match (amostra)
     amostras_cnpjs = []
     for cn in amostra_match:
         dcli = df[df["Cliente_norm"] == cn]
-        cnpjs = sorted(dcli["CNPJ"].astype(str).unique().tolist())
+        cnpjs = sorted(dcli["CNPJ"].astype(str).unique().tolist()) if "CNPJ" in dcli.columns else []
         amostras_cnpjs.append({"Cliente_norm": cn, "Qtde CNPJs": len(cnpjs), "Exemplo CNPJs": "; ".join(cnpjs[:5])})
 
     with st.expander("🔍 Diagnóstico"):
@@ -291,7 +335,7 @@ if st.button("🚀 Gerar relatório", type="primary", use_container_width=True):
             st.success("Todas as visitas encontraram correspondência por nome normalizado.")
 
         if amostras_cnpjs:
-            st.markdown("**Amostra de clientes com match e seus CNPJs:**")
+            st.markdown("**Amostra de clientes com match e seus CNPJs (para referência):**")
             st.dataframe(pd.DataFrame(amostras_cnpjs), use_container_width=True)
 
     # ---------- Processar por cliente (UMA LINHA POR NOME, somando CNPJs) ----------
@@ -305,19 +349,27 @@ if st.button("🚀 Gerar relatório", type="primary", use_container_width=True):
         if dcli.empty:
             continue
 
-        # CNPJs desse nome (para transparência no output)
-        cnpjs_cliente = dcli["CNPJ"].dropna().astype(str).unique().tolist()
+        # CNPJs desse nome (apenas para transparência na saída; não muda cálculo)
+        cnpjs_cliente = (
+            dcli["CNPJ"].dropna().astype(str).replace({"": "__SEM_CNPJ__"}).unique().tolist()
+            if "CNPJ" in dcli.columns else []
+        )
         cnpjs_cliente = [c for c in cnpjs_cliente if c != "__SEM_CNPJ__"]
         qtde_cnpjs = len(cnpjs_cliente)
         exemplo_cnpjs = "; ".join(sorted(cnpjs_cliente)[:5])
 
-        # AGREGA por Nome+AnoMes: soma DIAS DE CONTRATO de todos os CNPJs do cliente no mês
+        # AGREGA por Nome+AnoMes: soma DIAS DE CONTRATO de TODOS os CNPJs daquele nome no mês
         agg = dcli.groupby("AnoMes", as_index=False).agg({
             "DIAS DE CONTRATO": "sum",
         })
-        # Status: mantém o "último" do mês entre os registros daquele nome
-        estado_mes = dcli.groupby("AnoMes", as_index=False)["ESTADO"].last()
-        agr = pd.merge(agg, estado_mes, on="AnoMes", how="left")
+
+        # Status: mantém o "último" do mês entre os registros daquele nome (mesmo critério do original)
+        if "ESTADO" in dcli.columns:
+            estado_mes = dcli.groupby("AnoMes", as_index=False)["ESTADO"].last()
+            agr = pd.merge(agg, estado_mes, on="AnoMes", how="left")
+        else:
+            agr = agg
+            agr["ESTADO"] = np.nan
 
         # Campos auxiliares + baseline trimestral (por Nome)
         agr["Ano"] = pd.to_datetime(agr["AnoMes"]).dt.year
@@ -333,7 +385,7 @@ if st.button("🚀 Gerar relatório", type="primary", use_container_width=True):
         status_current_series = agr.loc[agr["AnoMes"] == current_month_str, "ESTADO"]
         status_current = status_current_series.iloc[0] if not status_current_series.empty else np.nan
 
-        # Impacto (por Nome, já somado)
+        # Impacto por Nome (série já somada)
         impacto_dias, impacto_pct = np.nan, np.nan
         if visit_month and (not np.isnan(baseline)) and (not np.isnan(current_val)):
             impacto_dias = current_val - baseline
