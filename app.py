@@ -1,4 +1,4 @@
-# app.py — ROI PX Day (por Nome, somando CNPJs)
+# app.py — ROI PX Day (por Nome, somando CNPJs) — sempre usa mês anterior ao mês corrente
 # Visão: UMA LINHA POR NOME (somando CNPJs do cliente) + Expander de Diagnóstico
 
 import streamlit as st
@@ -169,7 +169,6 @@ def detectar_colunas_visitas(dfv: pd.DataFrame) -> Tuple[str, str]:
     """
     Detecta a coluna de cliente e coluna de data em uma base de visitas.
     """
-    # tenta por candidatos usando find_column (que normaliza acentos)
     col_cli = find_column(dfv, ["cliente", "nome transportadora(s)", "nome", "transportadora", "transportadoras"])
     if not col_cli:
         col_cli = dfv.columns[0]
@@ -214,9 +213,9 @@ st.title("ROI PX Day — Relatório (por Nome, somando CNPJs)")
 
 col1, col2 = st.columns(2)
 with col1:
-    comportamento_file = st.file_uploader("📥 Base Mensal — comportamento (CSV)", type=["csv"]) 
+    comportamento_file = st.file_uploader("📥 Base Mensal — comportamento (CSV)", type=["csv"])
 with col2:
-    visitas_file = st.file_uploader("🎯 Base de Visitas PX Day — clientes e data (CSV)", type=["csv"]) 
+    visitas_file = st.file_uploader("🎯 Base de Visitas PX Day — clientes e data (CSV)", type=["csv"])
 
 with st.expander("⚙️ Parâmetros (opcional)"):
     meses_janela = st.number_input("Últimos N meses para a visão mensal", min_value=3, max_value=24, value=6, step=1)
@@ -288,21 +287,33 @@ if st.button("🚀 Gerar relatório", type="primary", use_container_width=True):
         st.error(f"Erro na base de visitas: {e}")
         st.stop()
 
-    # ---------- Determinar último mês fechado ----------
+    # ---------- Determinar mês de referência: SEMPRE o mês anterior ao mês corrente ----------
     if df["MES"].notna().any():
         try:
-            ultimo_mes_fechado = df["MES"].max().to_period("M").to_timestamp("M")
-            current_month_str = ultimo_mes_fechado.strftime("%Y-%m")
+            # Tenta usar America/Sao_Paulo para coerência local; se falhar, usa sem tz
+            try:
+                hoje = pd.Timestamp.now(tz="America/Sao_Paulo")
+            except Exception:
+                hoje = pd.Timestamp.now(tz=None)
+
+            mes_corrente = hoje.to_period("M")
+            mes_referencia = (mes_corrente - 1)  # sempre o mês anterior
+
+            # String YYYY-MM para colunas/cálculos (mantemos o nome current_month_str)
+            current_month_str = mes_referencia.strftime("%Y-%m")
+
+            # 🔒 Garante que nenhum dado do mês corrente (ou futuro) entre nos cálculos/pivôs
+            df = df[df["MES"].dt.to_period("M") <= mes_referencia].copy()
+
         except Exception:
-            st.error("Não foi possível determinar o último mês fechado a partir da coluna MES.")
+            st.error("Não foi possível determinar o mês de referência.")
             st.stop()
     else:
         st.error("A coluna MES não contém datas válidas.")
         st.stop()
 
-    # ---------- Janela de meses N ----------
-    mesesN = [p.strftime("%Y-%m") for p in pd.period_range(end=pd.Period(current_month_str, freq="M"),
-                                                           periods=meses_janela)]
+    # ---------- Janela de meses N (terminando no mês de referência) ----------
+    mesesN = [p.strftime("%Y-%m") for p in pd.period_range(end=mes_referencia, periods=meses_janela)]
 
     # ---------- Diagnóstico (antes do processamento) ----------
     visitas_pre = visitas.copy()
@@ -376,7 +387,7 @@ if st.button("🚀 Gerar relatório", type="primary", use_container_width=True):
         agr["MesNum"] = pd.to_datetime(agr["AnoMes"]).dt.month
         baseline, rot_trim = media_trimestral_visita(agr_mes=agr, visit_month_str=visit_month)
 
-        # Status no mês da visita e no atual
+        # Status no mês da visita e no atual (mês de referência)
         status_visit = agr.loc[agr["AnoMes"] == visit_month, "ESTADO"]
         status_visit_val = status_visit.iloc[0] if not status_visit.empty else np.nan
 
